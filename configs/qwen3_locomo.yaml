@@ -1,0 +1,20 @@
+llm_backend: openai
+
+model:
+  model_name: Qwen3-30B-A3B-Instruct-2507
+  api_key: ${QWEN3_API_KEY}
+  base_url: ${QWEN3_BASE_URL}
+
+generation:
+  temperature: 0.0
+  top_p: 0.9
+  max_tokens: 1024
+
+memory:
+  extraction_model: Qwen3-30B-A3B-Instruct-2507
+  extraction_backend: openai
+  retrieval_mode: combined
+  top_k: 60
+  summary_top_k: 5
+  llmlingua_model_path: /path/to/llmlingua-model
+  embedding_model_path: /path/to/embedding-model
