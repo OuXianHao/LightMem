@@ -1,4 +1,3 @@
-from openai import OpenAI
 import json
 from tqdm import tqdm
 import datetime
@@ -40,6 +39,44 @@ DEFAULT_QDRANT_DIR = './qdrant_pre_update'
 DEFAULT_EMBEDDING_MODEL_PATH = '/path/to/embedding-model'
 DEFAULT_RESULTS_DIR = './lightmem_locomo_results'
 DEFAULT_RETRIEVAL_LIMIT = 60
+
+
+class AnswerGenerator:
+    """OpenAI-compatible Qwen3 answer generation adapter."""
+
+    def __init__(self, args):
+        if args.llm_backend != "openai":
+            raise ValueError("Only --llm-backend openai is supported for Qwen3 API inference")
+        if not args.base_url:
+            raise ValueError("--base-url or QWEN3_BASE_URL is required for Qwen3 API inference")
+        if not args.api_key:
+            raise ValueError("--api-key or QWEN3_API_KEY is required for Qwen3 API inference")
+        from openai import OpenAI
+        self.client = OpenAI(api_key=args.api_key, base_url=args.base_url)
+        self.model = args.llm_model
+        self.temperature = args.temperature
+        self.top_p = args.top_p
+        self.max_tokens = args.max_tokens
+        self.base_url = args.base_url
+        logger.info("[LLM Backend]\nmodel_name = %s\nbase_url = %s", self.model, self.base_url)
+
+    def generate(self, messages):
+        logger.info("[LLM Backend]\nmodel_name = %s\nbase_url = %s", self.model, self.base_url)
+        response = self.client.chat.completions.create(
+            model=self.model,
+            messages=messages,
+            temperature=self.temperature,
+            top_p=self.top_p,
+            max_tokens=self.max_tokens,
+        )
+        usage = {
+            'prompt_tokens': getattr(response.usage, 'prompt_tokens', 0) if response.usage else 0,
+            'completion_tokens': getattr(response.usage, 'completion_tokens', 0) if response.usage else 0,
+            'total_tokens': getattr(response.usage, 'total_tokens', 0) if response.usage else 0,
+        }
+        if not response.choices:
+            raise RuntimeError("Qwen3 API returned no choices")
+        return response.choices[0].message.content or "", usage
 
 
 # ============ Dataset Parsing ============
@@ -288,8 +325,8 @@ def process_sample(
     sample: Dict,
     entry_loader: QdrantEntryLoader,
     retriever: VectorRetriever,
-    llm_client: OpenAI,
-    judge_client: OpenAI,
+    answer_generator: AnswerGenerator,
+    judge_client: Any,
     llm_model: str,
     judge_model: str,
     allow_categories: List[int],
@@ -297,7 +334,8 @@ def process_sample(
     total_limit: int,
     retrieval_mode: str,
     enable_summary: bool = False,
-    summary_limit: int = 5
+    summary_limit: int = 5,
+    judge_base_url: str = "configured judge client"
 ) -> Dict:
     """
     Process a single sample with all its QA pairs.
@@ -447,6 +485,9 @@ def process_sample(
         )
         
         # Generate answer
+        logger.info("[LLM Backend] query answering")
+        logger.info("model_name = %s", llm_model)
+        logger.info("base_url = %s", answer_generator.base_url)
         token_usage = {
             'prompt_tokens': 0,
             'completion_tokens': 0,
@@ -454,40 +495,28 @@ def process_sample(
         }
         
         try:
-            response = llm_client.chat.completions.create(
-                model=llm_model,
-                messages=[
-                    {"role": "system", "content": user_prompt}
-                ],
-                temperature=0.0
+            generated_answer, token_usage = answer_generator.generate([
+                {"role": "system", "content": "Answer the user's question using only the retrieved LightMem memories."},
+                {"role": "user", "content": user_prompt},
+            ])
+            sample_token_stats['total_prompt_tokens'] += token_usage.get('prompt_tokens', 0)
+            sample_token_stats['total_completion_tokens'] += token_usage.get('completion_tokens', 0)
+            sample_token_stats['total_tokens'] += token_usage.get('total_tokens', 0)
+            sample_token_stats['api_calls'] += 1
+            logger.info(
+                f"[{sample_id}] Token usage - Prompt: {token_usage.get('prompt_tokens', 0)}, "
+                f"Completion: {token_usage.get('completion_tokens', 0)}, "
+                f"Total: {token_usage.get('total_tokens', 0)}"
             )
-            
-            generated_answer = response.choices[0].message.content
-            
-            # Record token usage
-            if hasattr(response, 'usage') and response.usage:
-                token_usage['prompt_tokens'] = response.usage.prompt_tokens
-                token_usage['completion_tokens'] = response.usage.completion_tokens
-                token_usage['total_tokens'] = response.usage.total_tokens
-                
-                # Update sample statistics
-                sample_token_stats['total_prompt_tokens'] += token_usage['prompt_tokens']
-                sample_token_stats['total_completion_tokens'] += token_usage['completion_tokens']
-                sample_token_stats['total_tokens'] += token_usage['total_tokens']
-                sample_token_stats['api_calls'] += 1
-                
-                logger.info(
-                    f"[{sample_id}] Token usage - Prompt: {token_usage['prompt_tokens']}, "
-                    f"Completion: {token_usage['completion_tokens']}, "
-                    f"Total: {token_usage['total_tokens']}"
-                )
-            
             logger.info(f"[{sample_id}] Generated: {generated_answer}")
         except Exception as e:
             logger.error(f"[{sample_id}] Failed to generate answer: {e}")
             generated_answer = ""
         
         # Evaluate with LLM judge
+        logger.info("[LLM Backend] LoCoMo judge")
+        logger.info("model_name = %s", judge_model)
+        logger.info("base_url = %s", judge_base_url)
         try:
             label = evaluate_llm_judge(
                 question, reference, generated_answer,
@@ -539,12 +568,14 @@ def main():
     )
     
     # Data paths
-    parser.add_argument('--dataset', type=str, default=DEFAULT_DATA_PATH,
+    parser.add_argument('--dataset', '--data-file', dest='dataset', type=str, default=DEFAULT_DATA_PATH,
                        help="Path to dataset JSON file")
     parser.add_argument('--qdrant-dir', type=str, default=DEFAULT_QDRANT_DIR,
                        help="Path to Qdrant data directory")
     parser.add_argument('--output-dir', type=str, default=DEFAULT_RESULTS_DIR,
                        help="Output directory for results")
+    parser.add_argument('--output-file', type=str, default=None,
+                       help="Optional final summary JSON path (in addition to per-sample files)")
     
     # Retrieval configuration
     parser.add_argument('--limit-per-speaker', type=int, default=DEFAULT_RETRIEVAL_LIMIT,
@@ -570,20 +601,37 @@ def main():
                        help="Retrieval limit for summaries (only used if --enable-summary)")
     
     # LLM configuration
-    parser.add_argument('--llm-api-key', type=str, required=True,
-                       help="API key for LLM")
-    parser.add_argument('--llm-base-url', type=str, required=True,
-                       help="Base URL for LLM API")
-    parser.add_argument('--llm-model', type=str, required=True,
+    parser.add_argument('--api-key', '--llm-api-key', dest='api_key', type=str, default=os.getenv('QWEN3_API_KEY'),
+                       help="Qwen3 API key (or QWEN3_API_KEY)")
+    parser.add_argument('--base-url', '--llm-base-url', dest='base_url', type=str, default=os.getenv('QWEN3_BASE_URL'),
+                       help="OpenAI-compatible Qwen3 API base URL (or QWEN3_BASE_URL)")
+    parser.add_argument('--llm-model', '--model', dest='llm_model', type=str, default='Qwen3-30B-A3B-Instruct-2507',
                        help="LLM model name")
-    parser.add_argument('--judge-api-key', type=str, required=True,
-                       help="API key for judge")
-    parser.add_argument('--judge-base-url', type=str, required=True,
-                       help="Base URL for judge API")
-    parser.add_argument('--judge-model', type=str, required=True,
-                       help="Judge model name")
+    parser.add_argument('--judge-api-key', type=str, default=None,
+                       help="API key for judge; defaults to --api-key so evaluation can also use Qwen3")
+    parser.add_argument('--judge-base-url', type=str, default=None,
+                       help="Base URL for judge API; defaults to --base-url")
+    parser.add_argument('--judge-model', type=str, default=None,
+                       help="Judge model name; defaults to --model")
+    parser.add_argument('--llm-backend', choices=['openai'], default='openai',
+                       help="OpenAI-compatible API backend for Qwen3")
+    parser.add_argument('--temperature', type=float, default=0.0,
+                       help="Answer generation temperature")
+    parser.add_argument('--top-p', type=float, default=0.9,
+                       help="Answer generation nucleus sampling p")
+    parser.add_argument('--max-tokens', type=int, default=1024,
+                       help="Maximum answer tokens to generate")
     
     args = parser.parse_args()
+    if args.llm_backend != 'openai':
+        raise ValueError("Only --llm-backend openai is supported for the Qwen3 LoCoMo workflow")
+    if not args.api_key:
+        raise ValueError("--api-key or QWEN3_API_KEY is required for Qwen3 query answering")
+    if not args.base_url:
+        raise ValueError("--base-url or QWEN3_BASE_URL is required for Qwen3 query answering")
+    args.judge_api_key = args.judge_api_key or args.api_key
+    args.judge_base_url = args.judge_base_url or args.base_url
+    args.judge_model = args.judge_model or args.llm_model
     
     # Log configuration
     logger.info("=" * 80)
@@ -623,8 +671,8 @@ def main():
     if args.embedder == 'openai':
         embedder_cfg = BaseTextEmbedderConfig(
             model='text-embedding-3-small',
-            api_key=args.llm_api_key,
-            openai_base_url=args.llm_base_url,
+            api_key=args.api_key,
+            openai_base_url=args.base_url,
             embedding_dims=1536,
         )
         embedder = TextEmbedderOpenAI(embedder_cfg)
@@ -638,12 +686,17 @@ def main():
     
     retriever = VectorRetriever(embedder)
     
-    # Create LLM clients
-    llm_client = OpenAI(api_key=args.llm_api_key, base_url=args.llm_base_url)
+    # Create answer generator and judge client. The judge remains OpenAI-compatible
+    # because LoCoMo scoring uses a separate LLM judge.
+    answer_generator = AnswerGenerator(args)
+    from openai import OpenAI
     judge_client = OpenAI(api_key=args.judge_api_key, base_url=args.judge_base_url)
     
-    logger.info(f"LLM client initialized: {args.llm_model}")
+    logger.info(f"LLM generator initialized: {args.llm_model} ({args.llm_backend})")
     logger.info(f"Judge client initialized: {args.judge_model}")
+    logger.info("[LLM Backend] LoCoMo evaluation")
+    logger.info("model_name = %s", args.llm_model)
+    logger.info("base_url = %s", args.base_url)
     
     # Load dataset
     logger.info(f"\nLoading dataset from {args.dataset}")
@@ -669,12 +722,13 @@ def main():
     for sample in tqdm(samples, desc="Processing samples"):
         sample_result = process_sample(
             sample, entry_loader, retriever,
-            llm_client, judge_client,
+            answer_generator, judge_client,
             args.llm_model, args.judge_model,
             args.allow_categories, args.limit_per_speaker,
             args.total_limit, args.retrieval_mode,
             enable_summary=args.enable_summary,
-            summary_limit=args.summary_limit
+            summary_limit=args.summary_limit,
+            judge_base_url=args.judge_base_url
         )
         
         all_results.append(sample_result)
@@ -783,7 +837,9 @@ def main():
             "avg_summaries_per_question": total_summaries_used / total_questions if total_questions > 0 else 0,
         }
     
-    summary_file = os.path.join(args.output_dir, "summary.json")
+    summary_file = args.output_file or os.path.join(args.output_dir, "summary.json")
+    if os.path.dirname(summary_file):
+        os.makedirs(os.path.dirname(summary_file), exist_ok=True)
     with open(summary_file, 'w', encoding='utf-8') as f:
         json.dump(final_results, f, ensure_ascii=False, indent=2)
     

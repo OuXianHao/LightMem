@@ -3,7 +3,6 @@ import json
 from collections import defaultdict
 import re   
 import numpy as np
-from openai import OpenAI
 
 def extract_json(text):
     """
@@ -46,7 +45,7 @@ Just return the label CORRECT or WRONG in a json format with the key as "label".
 """
 
 
-def evaluate_llm_judge(question, gold_answer, generated_answer, client_obj=None, model_name="gpt-4o-mini"):
+def evaluate_llm_judge(question, gold_answer, generated_answer, client_obj=None, model_name=None):
     """Evaluate the generated answer against the gold answer using an LLM judge.
 
     Args:
@@ -54,9 +53,13 @@ def evaluate_llm_judge(question, gold_answer, generated_answer, client_obj=None,
         gold_answer: the ground-truth answer string
         generated_answer: the model's generated answer string
         client_obj: optional OpenAI client instance (useful to pass configured client with custom base_url)
-        model_name: model to use for judging (default gpt-4o-mini)
+        model_name: model to use for judging; required by caller
     """
-    used_client = client_obj if client_obj is not None else client
+    if client_obj is None:
+        raise ValueError("client_obj is required; pass an OpenAI-compatible judge client")
+    if not model_name:
+        raise ValueError("model_name is required for LLM judge calls")
+    used_client = client_obj
     response = used_client.chat.completions.create(
         model=model_name,
         messages=[

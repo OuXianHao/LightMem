@@ -1,4 +1,5 @@
 import concurrent
+import logging
 from collections import defaultdict
 from openai import OpenAI
 from typing import List, Dict, Optional, Literal, Any
@@ -8,8 +9,9 @@ from lightmem.memory.prompts import EXTRACTION_PROMPTS, METADATA_GENERATE_PROMPT
 from lightmem.configs.memory_manager.base_config import BaseMemoryManagerConfig
 from lightmem.memory.utils import clean_response
 
+logger = logging.getLogger(__name__)
+
 model_name_context_windows = {
-    "gpt-4o-mini": 128000,
     "qwen3-30b-a3b-instruct-2507": 128000,
     "glm-4.6": 200000,
     "DEFAULT": 128000,  # Recommended default context window
@@ -21,8 +23,8 @@ class OpenaiManager:
         self.config = config
 
         if not self.config.model:
-            self.config.model = "gpt-4o-mini"
-        
+            raise ValueError("OpenAI-compatible memory manager requires configs.model (for this workflow, Qwen3-30B-A3B-Instruct-2507).")
+
         if self.config.model in model_name_context_windows:
             self.context_windows = model_name_context_windows[self.config.model]
         else:
@@ -38,14 +40,20 @@ class OpenaiManager:
                 or "https://openrouter.ai/api/v1",
             )
         else:
-            api_key = self.config.api_key or os.getenv("OPENAI_API_KEY")
+            api_key = self.config.api_key or os.getenv("QWEN3_API_KEY") or os.getenv("OPENAI_API_KEY")
             base_url = (
                 self.config.openai_base_url
+                or os.getenv("QWEN3_BASE_URL")
                 or os.getenv("OPENAI_API_BASE")
                 or os.getenv("OPENAI_BASE_URL")
-                or "https://api.openai.com/v1"
             )
+            if not api_key:
+                raise ValueError("OpenAI-compatible memory manager requires an API key; pass --api-key or set QWEN3_API_KEY.")
+            if not base_url:
+                raise ValueError("OpenAI-compatible memory manager requires a base URL; pass --base-url or set QWEN3_BASE_URL.")
 
+            self.base_url = base_url
+            logger.info("[LLM Backend]\nmodel_name = %s\nbase_url = %s", self.config.model, self.base_url)
             self.client = OpenAI(api_key=api_key, base_url=base_url, http_client=http_client)
 
     def _parse_response(self, response, tools):
@@ -130,6 +138,7 @@ class OpenaiManager:
             params["tools"] = tools
             params["tool_choice"] = tool_choice
 
+        logger.info("[LLM Backend]\nmodel_name = %s\nbase_url = %s", self.config.model, getattr(self, "base_url", self.config.openai_base_url))
         response = self.client.chat.completions.create(**params)
         usage_info = {
             "prompt_tokens": response.usage.prompt_tokens,

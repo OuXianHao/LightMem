@@ -44,8 +44,10 @@ class LLMModel:
         # Auto-detect based on model name patterns
         if "gpt" in model_name_lower:
             return "openai"
-        elif "qwen3" in model_name_lower:
+        elif "qwen3vl" in model_name_lower or "qwen3-vl" in model_name_lower:
             return "qwen3vl"
+        elif "qwen3" in model_name_lower or "qwen" in model_name_lower:
+            return "qwen3"
         else:
             raise ValueError(f"Unknown model name: {model_name}")
 
@@ -56,6 +58,9 @@ class LLMModel:
         elif self.provider == "qwen3vl":
             from .qwen3vl import Qwen3VLModel
             return Qwen3VLModel(model_name=self.model_name, **kwargs)
+        elif self.provider == "qwen3":
+            from .qwen3 import Qwen3Model
+            return Qwen3Model(model_name=self.model_name, **kwargs)
         else:
             raise ValueError(f"Unsupported provider: {self.provider}")
 
@@ -65,7 +70,7 @@ class LLMModel:
         """
         if self.provider == "openai":
             return self.model.generate(prompt, **kwargs)
-        elif self.provider == "qwen3vl":
+        elif self.provider in {"qwen3vl", "qwen3"}:
             return self.model.generate(prompt, **kwargs)
         else:
             raise NotImplementedError(f"Model {self.provider} does not support text generation.")
@@ -76,7 +81,7 @@ class LLMModel:
         """
         if self.provider == "openai":
             return self.model.generate_batch(batch_prompts, **kwargs)
-        elif self.provider == "qwen3vl":
+        elif self.provider in {"qwen3vl", "qwen3"}:
             return self.model.generate_batch(batch_prompts, **kwargs)
         else:
             raise NotImplementedError(f"Model {self.provider} does not support batch generation.")

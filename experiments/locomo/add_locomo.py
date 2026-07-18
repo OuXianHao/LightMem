@@ -1,4 +1,3 @@
-from openai import OpenAI
 import json
 from tqdm import tqdm
 import datetime
@@ -29,7 +28,7 @@ API_KEYS = [
     'your-api-key-5',
 ]
 API_BASE_URL = ''
-LLM_MODEL = 'gpt-4o-mini'
+LLM_MODEL = 'Qwen3-30B-A3B-Instruct-2507'
 
 # Model Paths
 LLMLINGUA_MODEL_PATH = '/path/to/llmlingua-model'
@@ -64,7 +63,27 @@ def parse_args():
                        help='Top K seeds for summarization')
     parser.add_argument('--workers', type=int, default=MAX_WORKERS, 
                        help='Max parallel workers')
-    
+    parser.add_argument('--data-file', type=str, default=DATA_PATH,
+                       help='Path to LoCoMo JSON file')
+    parser.add_argument('--model', type=str, default='Qwen3-30B-A3B-Instruct-2507',
+                       help='Remote Qwen3 model name')
+    parser.add_argument('--llm-backend', choices=['openai'], default='openai',
+                       help='OpenAI-compatible API backend for Qwen3')
+    parser.add_argument('--base-url', type=str, default=os.getenv('QWEN3_BASE_URL') or API_BASE_URL,
+                       help='OpenAI-compatible API base URL, for example https://xxx/v1 (or QWEN3_BASE_URL)')
+    parser.add_argument('--api-key', type=str, default=os.getenv('QWEN3_API_KEY'),
+                       help='Qwen3 API key (or QWEN3_API_KEY)')
+    parser.add_argument('--temperature', type=float, default=0.1,
+                       help='Memory manager generation temperature')
+    parser.add_argument('--top-p', type=float, default=0.9,
+                       help='Memory manager top_p')
+    parser.add_argument('--max-tokens', type=int, default=2000,
+                       help='Memory manager max completion tokens')
+    parser.add_argument('--llmlingua-model-path', type=str, default=LLMLINGUA_MODEL_PATH,
+                       help='Path/name for LLMLingua2 compressor model')
+    parser.add_argument('--embedding-model-path', type=str, default=EMBEDDING_MODEL_PATH,
+                       help='Path/name for HuggingFace embedding model')
+
     return parser.parse_args()
 # ============ Utility Functions ============
 
@@ -161,7 +180,7 @@ def load_lightmem(collection_name, api_key, args, base_dir=QDRANT_POST_UPDATE_DI
             "model_name": "llmlingua-2",
             "configs": {
                 "llmlingua_config": {
-                    "model_name": LLMLINGUA_MODEL_PATH,
+                    "model_name": args.llmlingua_model_path,
                     "device_map": "cuda",
                     "use_llmlingua2": True,
                 },
@@ -183,10 +202,12 @@ def load_lightmem(collection_name, api_key, args, base_dir=QDRANT_POST_UPDATE_DI
         "memory_manager": {
             "model_name": "openai",
             "configs": {
-                "model": LLM_MODEL,
+                "model": args.model,
                 "api_key": api_key,
-                "max_tokens": 16000,
-                "openai_base_url": API_BASE_URL
+                "max_tokens": args.max_tokens,
+                "temperature": args.temperature,
+                "top_p": args.top_p,
+                "openai_base_url": args.base_url,
             },
         },
         "extract_threshold": 0.1,
@@ -194,7 +215,7 @@ def load_lightmem(collection_name, api_key, args, base_dir=QDRANT_POST_UPDATE_DI
         "text_embedder": {
             "model_name": "huggingface",
             "configs": {
-                "model": EMBEDDING_MODEL_PATH,
+                "model": args.embedding_model_path,
                 "embedding_dims": 384,
                 "model_kwargs": {"device": "cuda"},
             },
@@ -281,6 +302,12 @@ def collection_entry_count(collection_name, base_dir):
         return -1
 
 
+def log_llm_backend(logger_obj, args, stage):
+    logger_obj.info("[LLM Backend] %s", stage)
+    logger_obj.info("model_name = %s", args.model)
+    logger_obj.info("base_url = %s", args.base_url)
+
+
 # ============ Core Processing Function ============
 
 def process_single_sample(sample, api_key, args):
@@ -306,6 +333,7 @@ def process_single_sample(sample, api_key, args):
         logger.info(f"  Speakers: {speaker_a}, {speaker_b}")
         logger.info(f"\n{'─'*70}")
         logger.info("Phase 1: Building memory (add_memory)")
+        log_llm_backend(logger, args, "memory extraction / memory compression")
         logger.info(f"{'─'*70}")
         
         lightmem = load_lightmem(collection_name=sample_id, api_key=api_key, args=args)
@@ -380,6 +408,7 @@ def process_single_sample(sample, api_key, args):
         if args.enable_summary:
             logger.info(f"\n{'─'*70}")
             logger.info("Phase 2.5: Generating summaries")
+            log_llm_backend(logger, args, "memory summarization")
             logger.info(f"{'─'*70}")
             logger.info(f"  Time window: {args.summary_time_window}s")
             logger.info(f"  Top K Seeds: {args.summary_top_k_seeds}")
@@ -436,6 +465,7 @@ def process_single_sample(sample, api_key, args):
         
         logger.info(f"\n{'─'*70}")
         logger.info("Phase 3: Performing offline update")
+        log_llm_backend(logger, args, "memory update")
         logger.info(f"{'─'*70}")
         
         update_start_stats = lightmem.get_token_statistics()
@@ -535,6 +565,12 @@ def process_single_sample(sample, api_key, args):
 
 def main():
     args = parse_args()
+    if args.llm_backend != 'openai':
+        raise ValueError("Only --llm-backend openai is supported for the Qwen3 LoCoMo workflow")
+    if not args.api_key:
+        raise ValueError("--api-key or QWEN3_API_KEY is required so every LightMem LLM call uses Qwen3")
+    if not args.base_url:
+        raise ValueError("--base-url or QWEN3_BASE_URL is required so every LightMem LLM call uses Qwen3")
     global MAX_WORKERS
     MAX_WORKERS = args.workers
     main_logger = logging.getLogger("lightmem.parallel.main")
@@ -556,13 +592,17 @@ def main():
     main_logger.info("PARALLEL MEMORY BUILDING")
     main_logger.info("=" * 70)
     main_logger.info(f"Workers:         {MAX_WORKERS}")
-    main_logger.info(f"API Keys:        {len(API_KEYS)}")
+    main_logger.info(f"API Keys:        {1 if args.api_key else len(API_KEYS)}")
+    main_logger.info(f"LLM backend:     {args.llm_backend}")
+    main_logger.info(f"Model:           {args.model}")
+    main_logger.info(f"Base URL:        {args.base_url}")
+    log_llm_backend(main_logger, args, "LoCoMo memory construction")
     main_logger.info(f"Executor:        {'ProcessPool' if USE_PROCESS_POOL else 'ThreadPool'}")
     main_logger.info(f"Post-update dir: {QDRANT_POST_UPDATE_DIR}")
     main_logger.info(f"Pre-update dir:  {QDRANT_PRE_UPDATE_DIR}")
     main_logger.info("=" * 70)
     
-    data = json.load(open(DATA_PATH, "r"))
+    data = json.load(open(args.data_file, "r"))
     main_logger.info(f"\nLoaded {len(data)} samples from dataset")
     
     main_logger.info("\n" + "=" * 70)
@@ -633,7 +673,7 @@ def main():
         future_to_sample = {}
         for idx, sample in enumerate(missing):
             api_key_idx = idx % len(API_KEYS)
-            api_key = API_KEYS[api_key_idx]
+            api_key = args.api_key
             
             future = executor.submit(process_single_sample, sample, api_key, args)
             future_to_sample[future] = sample
